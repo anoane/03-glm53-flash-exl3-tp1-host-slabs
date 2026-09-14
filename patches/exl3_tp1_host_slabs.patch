@@ -1,0 +1,229 @@
+--- exl3_vllm_pristine.py	2026-09-02 16:59:15
++++ exl3_vllm.py	2026-09-02 16:37:23
+@@ -535,6 +535,11 @@
+                 seen.add(storage_key)
+                 total += storage.nbytes()
+     return total
++
++
++# Running total of expert-slab bytes placed on the GPU, used to honour
++# EXL3_GPU_SLAB_GIB when deciding device vs pinned-host slab placement.
++_EXL3_GPU_SLAB_BYTES = 0
+ 
+ 
+ def _scratch_view(backing: torch.Tensor, spec: Any) -> torch.Tensor:
+@@ -2582,10 +2587,74 @@
+                 if len(self.exl3_shard_ids) > 1
+                 else (self.exl3_num_experts,)
+             )
+-            self.exl3_backing = torch.empty(
+-                prefix + tuple(loaded_weight.shape),
+-                dtype=loaded_weight.dtype,
+-                device=self.device,
++            _shape = prefix + tuple(loaded_weight.shape)
++            _nbytes = loaded_weight.element_size()
++            for _d in _shape:
++                _nbytes *= int(_d)
++            # Host-resident expert slabs.
++            #
++            # The slab-alias invariant (see _rank_sliced_backing) only requires that each
++            # expert tensor be a VIEW into its own slab -- it never requires the slab to
++            # live on the GPU. Under CUDA unified addressing a pinned host allocation is
++            # dereferenceable from device code, so a slab placed in pinned host memory
++            # keeps the alias intact and the B12X kernels read it zero-copy over PCIe.
++            #
++            # That makes the GPU budget a placement decision rather than a hard capacity
++            # limit: fill the device up to EXL3_GPU_SLAB_GIB, then place the remainder on
++            # the host. Weight offloading proper cannot be used here because it substitutes
++            # a copy and breaks the pointer identity; this keeps the identity and moves the
++            # storage instead.
++            _budget_gib = float(os.environ.get("EXL3_GPU_SLAB_GIB", "0") or 0)
++            _host = False
++            # Only the large trellis slabs are worth spilling. The per-layer scale and
++            # rotation slabs (suh/svh) and codebook sentinels are ~MB each; placing them
++            # on the host saves nothing and costs a PCIe read per use, and the b12x
++            # prepare path expects them on the compute device. Anything under the
++            # threshold stays on the GPU without counting against the budget.
++            _SMALL_SLAB_BYTES = 64 * 1024 ** 2
++            if (
++                _budget_gib > 0 and self.device.type == "cuda"
++                and _nbytes >= _SMALL_SLAB_BYTES
++            ):
++                global _EXL3_GPU_SLAB_BYTES
++                if _EXL3_GPU_SLAB_BYTES + _nbytes > _budget_gib * (1024 ** 3):
++                    _host = True
++                else:
++                    _EXL3_GPU_SLAB_BYTES += _nbytes
++            if _host:
++                # Exact-size pinned host slab. torch.empty(pin_memory=True) goes through
++                # the caching host allocator, which rounds every request up to the next
++                # power of two: a 2.25 GiB slab becomes 4 GiB, 1.12 becomes 2. Across ~80
++                # host slabs that turned a ~76 GiB placement into ~98 GiB of Shmem and
++                # tripped the host limit. Allocate pageable at exact size and
++                # cudaHostRegister it in place instead: pinned and device-mapped (UVA)
++                # with zero rounding, and the data_ptr is unchanged for the alias check.
++                self.exl3_backing = torch.empty(
++                    _shape, dtype=loaded_weight.dtype, device="cpu"
++                )
++                try:
++                    _rc = torch.cuda.cudart().cudaHostRegister(
++                        self.exl3_backing.data_ptr(), _nbytes, 1 | 2,  # Portable|Mapped
++                    )
++                    if int(_rc) != 0:
++                        raise RuntimeError(f"cudaHostRegister rc={int(_rc)}")
++                    _how = "HOST-registered(exact)"
++                except Exception as _e:  # noqa: BLE001
++                    self.exl3_backing = torch.empty(
++                        _shape, dtype=loaded_weight.dtype,
++                        device="cpu", pin_memory=True,
++                    )
++                    _how = f"HOST-pinned(fallback: {_e})"
++            else:
++                self.exl3_backing = torch.empty(
++                    _shape, dtype=loaded_weight.dtype, device=self.device,
++                )
++                _how = "GPU"
++            # One line per slab so placement can be audited from the log.
++            logger.info(
++                "EXL3 slab %s: %.2f GiB -> %s (gpu slabs so far %.1f / budget %.0f GiB)",
++                getattr(self, "exl3_param_name", "?"), _nbytes / 1024**3, _how,
++                _EXL3_GPU_SLAB_BYTES / 1024**3, _budget_gib,
+             )
+         shard_index = self.exl3_shard_ids.index(shard_id)
+         target = (
+@@ -2600,6 +2669,12 @@
+             )
+         target.copy_(loaded_weight, non_blocking=True)
+         self.exl3_tensors[key] = target
++        if int(expert_id) == 0 and self.exl3_backing.device.type == "cpu":
++            logger.info(
++                "SLAB-LOAD DIAG %s[%s,%s]: id(param)=%#x backing.ptr=%#x target.ptr=%#x dev=%s",
++                getattr(self, "exl3_param_name", "?"), expert_id, shard_id,
++                id(self), self.exl3_backing.data_ptr(), target.data_ptr(), target.device,
++            )
+ 
+ 
+ def _exl3_moe_weight_loader(
+@@ -2752,7 +2827,13 @@
+         layer.exl3_shared_h_rotations = shared_h
+         if rank_sliced_metadata is not None:
+             checkpoint_tp = int(rank_sliced_metadata["tp"])
+-            ep_from_unsliced = use_ep and (
++            # An "unsliced_tp_stream" checkpoint stores FULL per-expert tensors; the
++            # metadata's "tp" records the layout this pack was produced for, not a
++            # property of the stored weights. The loader slices on consumption, so any
++            # runtime TP is representable -- including TP=1, where no slicing happens at
++            # all. Gating this on use_ep made single-GPU loads impossible for a
++            # checkpoint that is not actually rank-partitioned.
++            ep_from_unsliced = (
+                 rank_sliced_metadata.get("source_layout") == "unsliced_tp_stream"
+             )
+             if not ep_from_unsliced and checkpoint_tp != layer.exl3_tp_size:
+@@ -2888,6 +2969,14 @@
+         for prefix in ("w13", "w2"):
+             for attr in ("suh", "svh", "trellis", "mcg", "mul1"):
+                 param = getattr(layer, f"{prefix}_{attr}")
++                # Slab-backed params were built as contiguous views into a backing
++                # tensor that was placed deliberately (GPU, or pinned+UVA-mapped host
++                # under EXL3_GPU_SLAB_GIB). Re-homing those views to the layer device
++                # copies every host slab back onto the GPU -- defeating the placement
++                # and breaking the slab alias the kernels rely on. Leave them alone;
++                # only non-slab tensors (the codebook sentinels) get normalised.
++                if getattr(param, "exl3_backing", None) is not None:
++                    continue
+                 for key, tensor in list(param.exl3_tensors.items()):
+                     param.exl3_tensors[key] = tensor.to(
+                         device=device, non_blocking=True
+@@ -3080,6 +3169,16 @@
+                 else backing[expert_id]
+             )
+             if tensor.data_ptr() != expected.data_ptr():
++                logger.error(
++                    "SLAB-ALIAS DIAG %s[%s,%s]: stored.ptr=%#x dev=%s shape=%s | "
++                    "expected.ptr=%#x dev=%s | backing.ptr=%#x dev=%s contig=%s | "
++                    "id(param)=%#x n_tensors=%d",
++                    param_name, expert_id, shard_id,
++                    tensor.data_ptr(), tensor.device, tuple(tensor.shape),
++                    expected.data_ptr(), expected.device,
++                    backing.data_ptr(), backing.device, backing.is_contiguous(),
++                    id(param), len(param.exl3_tensors),
++                )
+                 raise RuntimeError(
+                     "rank-sliced EXL3 expert payload lost its slab alias: "
+                     f"{param_name}[{expert_id},{shard_id}]"
+@@ -3103,13 +3202,21 @@
+             )
+         step = slab.stride(0) * slab.element_size()
+         base = slab.data_ptr()
++        # A host-resident (pinned, UVA-mapped) slab yields addresses the kernel can
++        # dereference, but the table of those addresses is kernel metadata and must
++        # itself be on the compute device -- not wherever the slab's storage happens
++        # to live.
++        table_device = (
++            slab.device if slab.is_cuda
++            else torch.device("cuda", torch.cuda.current_device())
++        )
+         return torch.tensor(
+             [
+                 base + (0 if rows == 1 else expert_id) * step
+                 for expert_id in range(entries)
+             ],
+             dtype=torch.int64,
+-            device=slab.device,
++            device=table_device,
+         )
+ 
+     @staticmethod
+@@ -3382,6 +3489,10 @@
+                 f"rank-sliced EXL3 requires an integral 3/4/5/6 bitrate, got {bits!r}"
+             )
+ 
++        # Compute device for kernel-side metadata. w13.device would be the slab's
++        # STORAGE device, which is the host for slabs placed under EXL3_GPU_SLAB_GIB;
++        # rotations, tile plans and pointer tables must be on the GPU regardless.
++        _compute_dev = layer.w13_trellis.device
+         w13 = self._rank_sliced_backing(layer, "w13_trellis")
+         w2 = self._rank_sliced_backing(layer, "w2_trellis")
+         gate_suh, up_suh = self._rank_sliced_backing(layer, "w13_suh")
+@@ -3411,7 +3522,7 @@
+         intermediate_rotations = torch.empty(
+             (num_experts, 3 * intermediate_size),
+             dtype=torch.float16,
+-            device=w13.device,
++            device=_compute_dev,
+         )
+         intermediate_rotations[:, :intermediate_size].copy_(gate_svh)
+         intermediate_rotations[:, intermediate_size : 2 * intermediate_size].copy_(
+@@ -3434,7 +3545,7 @@
+                 ),
+                 trellis_bits=bits,
+                 use_expert_map=bool(getattr(layer, "exl3_use_ep", False)),
+-                device=w13.device,
++                device=_compute_dev,
+             )
+         else:
+             tile_config = self._trellis_tile_config(hidden_size, intermediate_size)
+@@ -3455,6 +3566,7 @@
+         native_weights = native_api.prepare_weights(
+             w13=w13,
+             w2=w2,
++            device=_compute_dev,
+             hidden_size=hidden_size,
+             intermediate_size=intermediate_size,
+             num_experts=num_experts,
+@@ -3495,13 +3607,13 @@
+             if not isinstance(expert_map, torch.Tensor):
+                 raise RuntimeError("EXL3 EP lost its materialized expert_map")
+             layer.exl3_expert_map = expert_map.to(
+-                device=w13.device, dtype=torch.int32
++                device=_compute_dev, dtype=torch.int32
+             ).contiguous()
+         else:
+             layer.exl3_expert_map = torch.arange(
+                 num_experts,
+                 dtype=torch.int64,
+-                device=w13.device,
++                device=_compute_dev,
+             )
+         layer.exl3_trellis_tile_config = tile_config
+         if getattr(layer, "exl3_shared_h_rotations", False):

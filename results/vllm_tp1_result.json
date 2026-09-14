@@ -1,0 +1,38 @@
+{
+ "outcome": "SERVING on one GPU at 256k context after 8 source patches; coherent output verified; ~11 tok/s (PCIe-bound)",
+ "config": {
+  "image": "verdictai/glm53-flash-exl3-k4:r19-sm120-tp2-ep2-dcp2-v84-language-only",
+  "checkpoint": "brandonmusic/GLM-5.3-Flash-tr3-4bpw (163.56 GiB, 145.55 GiB routed experts)",
+  "tensor_parallel_size": 1,
+  "EXL3_GPU_SLAB_GIB": 58,
+  "VLLM_EXL3_PREFILL_BLOCK_M": 64,
+  "kv_cache_dtype": "nvfp4_ds_mla",
+  "max_model_len": 262144,
+  "gpu_memory_utilization": 0.95,
+  "load_args": "--max-parallel-loading-workers 1 --safetensors-prefetch-num-threads 1"
+ },
+ "ready_state": {
+  "shards": "120/120",
+  "gpu_slabs": 202,
+  "host_registered_slabs": 50,
+  "alias_failures": 0,
+  "gpu_mib": 92050,
+  "host_used_gb": 107,
+  "host_avail_gb": 17,
+  "kv_cache_tokens": 2644235,
+  "memguard_fired": false
+ },
+ "smoke": {
+  "prompt_tokens": 840,
+  "completion_tokens": 300,
+  "wall_s": 27.4,
+  "approx_tok_s": 11,
+  "coherent": true,
+  "note": "raw SSE checked; vLLM emits reasoning as delta.reasoning"
+ },
+ "walls_patched": 8,
+ "not_possible": [
+  "fp8 KV on B12X_MLA_SPARSE for the 512-head NoPE path (nvfp4_ds_mla only)"
+ ],
+ "verdict": "Runs, but ~11 tok/s vs 17.6 for exl3 4.05 at equal quality on the same box; keep as reference for the patches, not as a serving path."
+}

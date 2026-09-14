@@ -1,0 +1,8 @@
+# run 11
+Application startup complete
+Capturing CUDA graphs (FULL): 100%|██████████| 1/1 [00:00<00:00,
+GPU KV cache size: 2,644,235 toke
+Maximum concurrency for 262,144 toke
+Using nvfp4_ds_mla data type to store kv cache
+max model len 262144
+slabs: GPU=202 HOST=50 alias_diag=0

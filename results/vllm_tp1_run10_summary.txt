@@ -1,0 +1,6 @@
+# run 10
+Using fp8 data type to store kv cache
+max model len 262144
+slabs: GPU=0 HOST=0 alias_diag=0
+ERROR 09-02 08:51:43 [core.py:1383] ValueError: Selected backend AttentionBackendEnum.B12X_MLA_SPARSE is not valid for this configuration. Reason: ["B12X_MLA_SPARSE supports head_size=512 (qk_rope_head_dim=0) only with kv_cache_dtype='nvfp4_ds_mla'; got 'fp8'"
+ValueError: Selected backend AttentionBackendEnum.B12X_MLA_SPARSE is not valid for this configuration. Reason: ["B12X_MLA_SPARSE supports head_size=512 (qk_rope_head_dim=0) only with kv_cache_dtype='nvfp4_ds_mla'; got 'fp8'"]

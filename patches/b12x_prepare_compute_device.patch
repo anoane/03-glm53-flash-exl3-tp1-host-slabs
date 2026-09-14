@@ -1,0 +1,65 @@
+--- b12x_prepare.py	2026-09-02 15:58:07
++++ b12x_prepare_patched.py	2026-09-02 16:37:23
+@@ -1606,7 +1606,13 @@
+     trellis_bits = int(trellis_bits)
+     expected_i16_shape = (*expected_prefix_shape, 16 * trellis_bits)
+     expected_i32_shape = (*expected_prefix_shape, 8 * trellis_bits)
+-    if tensor.device != device:
++    # Storage may be pinned, UVA-mapped host memory when the caller places expert
++    # slabs there; the kernel pulls tiles by address (cp.async), so what matters is
++    # that a CUDA compute device is targeted and the bytes are reachable -- not that
++    # they live on that device. Still reject a tensor on a *different* CUDA device.
++    if tensor.device != device and not (
++        device.type == "cuda" and tensor.device.type == "cpu"
++    ):
+         raise ValueError(
+             f"trellis_t256 {name} must be on {device}, got {tensor.device}"
+         )
+@@ -1821,27 +1827,34 @@
+                 "explicit trellis_bits disagrees with native tensor shape: "
+                 f"requested={requested_trellis_bits}, inferred={resolved_trellis_bits}"
+             )
+-        resolved_device = w13.device
+-        if resolved_device.type != "cuda":
+-            raise ValueError(
+-                "trellis_t256 W4A16 weights require CUDA storage, got "
+-                f"{resolved_device}"
+-            )
++        # The trellis is consumed IN PLACE by the kernels through a pointer table
++        # (this function returns only metadata: codebook, bits, rotations, tile
++        # config -- it never repacks or copies w13/w2). What the kernel needs is a
++        # CUDA *compute* device; the bytes may legitimately live in pinned,
++        # UVA-mapped host memory when the caller places expert slabs there. So an
++        # explicit `device` names the compute device and is authoritative; only
++        # when none is given do we fall back to the storage device, and then the
++        # original CUDA-storage requirement still applies.
++        storage_device = w13.device
+         if device is not None:
+             requested_device = (
+                 torch.device("cuda", int(device))
+                 if isinstance(device, int)
+                 else torch.device(device)
+             )
+-            device_matches = requested_device.type == resolved_device.type and (
+-                requested_device.index is None
+-                or requested_device.index == resolved_device.index
+-            )
+-            if not device_matches:
++            if requested_device.type != "cuda":
+                 raise ValueError(
+-                    "explicit trellis_t256 device does not match supplied weights: "
+-                    f"device={requested_device}, weights={resolved_device}"
++                    "trellis_t256 W4A16 requires a CUDA compute device, got "
++                    f"{requested_device}"
+                 )
++            resolved_device = requested_device
++        else:
++            resolved_device = storage_device
++            if resolved_device.type != "cuda":
++                raise ValueError(
++                    "trellis_t256 W4A16 weights require CUDA storage, got "
++                    f"{resolved_device}"
++                )
+         if w13_layout == "trellis_t256_proj":
+             expected_w13_prefix = (
+                 2,
